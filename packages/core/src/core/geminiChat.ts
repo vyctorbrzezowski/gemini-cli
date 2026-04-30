@@ -48,6 +48,7 @@ import {
 } from '../telemetry/types.js';
 import { handleFallback } from '../fallback/handler.js';
 import { isFunctionResponse } from '../utils/messageInspectors.js';
+import { scrubHistory } from '../utils/historyHardening.js';
 import { partListUnionToString } from './geminiRequest.js';
 import type { ModelConfigKey } from '../services/modelConfigService.js';
 import { estimateTokenCountSync } from '../utils/tokenCalculation.js';
@@ -502,8 +503,11 @@ export class GeminiChat {
     abortSignal: AbortSignal,
     role: LlmRole,
   ): Promise<AsyncGenerator<GenerateContentResponse>> {
+    // Last mile scrubbing to remove internal tracking properties (e.g. callIndex)
+    // before sending to the Gemini API. This whitelists only standard Gemini fields.
+    const scrubbedContents = scrubHistory([...requestContents]);
     const contentsForPreviewModel =
-      this.ensureActiveLoopHasThoughtSignatures(requestContents);
+      this.ensureActiveLoopHasThoughtSignatures(scrubbedContents);
 
     // Track final request parameters for AfterModel hooks
     const {
@@ -945,7 +949,14 @@ export class GeminiChat {
           }
 
           modelResponseParts.push(
-            ...content.parts.filter((part) => !part.thought),
+            ...content.parts
+              .filter((part) => !part.thought)
+              .map((part) => ({
+                ...part,
+                callIndex: chunk.functionCalls?.findIndex(
+                  (fc) => fc.name === part.functionCall?.name,
+                ),
+              })),
           );
         }
       }
@@ -990,29 +1001,20 @@ export class GeminiChat {
       ? Array.from(finalFunctionCallsMap.values())
       : legacyFunctionCalls;
 
+    let currentCallSourceIndex = -1;
     if (this.context.config.isContextManagementEnabled()) {
       debugLogger.log(
         `[GeminiChat] Starting consolidation for ${modelResponseParts.length} raw parts and ${finalFunctionCalls.length} assembled function calls.`,
       );
       for (const part of modelResponseParts) {
         if (part.functionCall) {
-          // Skip partial functionCall stream chunks! We will replace them
-          // entirely with the pristine, fully assembled objects from the SDK
-          // (finalFunctionCalls) immediately below. We only push the very first
-          // partial chunk of a sequence as a placeholder so we know *where*
-          // in the sequence of parts the tool call happened.
-          const lastPart = consolidatedParts[consolidatedParts.length - 1];
-          const currentId = part.functionCall.id;
-          const lastId = lastPart?.functionCall?.id;
-
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const partIndex = (part as any).callIndex;
           const isNewCall =
-            !lastPart?.functionCall ||
-            (currentId !== undefined &&
-              lastId !== undefined &&
-              currentId !== lastId) ||
-            lastPart.functionCall.name !== part.functionCall.name;
+            partIndex !== undefined && partIndex > currentCallSourceIndex;
 
           if (isNewCall) {
+            currentCallSourceIndex = partIndex;
             consolidatedParts.push({ ...part }); // Push placeholder
           }
         } else {

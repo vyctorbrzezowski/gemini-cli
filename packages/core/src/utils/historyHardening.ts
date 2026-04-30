@@ -5,7 +5,7 @@
  */
 
 import type { Content, Part } from '@google/genai';
-import { debugLogger } from '../utils/debugLogger.js';
+import { debugLogger } from './debugLogger.js';
 
 export const SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
@@ -42,31 +42,20 @@ export function hardenHistory(
 
   const sentinels = { ...DEFAULT_SENTINELS, ...options.sentinels };
 
-  debugLogger.log(
-    `[HistoryHardener] Hardening history with ${history.length} turns`,
-  );
-
   // Pass 1: Initial Coalesce & Empty Turn Removal
   let coalesced = coalesce(history);
 
   // Pass 2: Tool Pairing & Signatures (The semantic layer)
-  // This might inject sentinel responses or drop orphaned responses.
   coalesced = pairToolsAndEnforceSignatures(coalesced, sentinels);
 
   // Pass 3: Structural Refinement (Hoisting & Re-ordering of tool responses)
   coalesced = refineToolResponses(coalesced);
 
   // Pass 4: Enforce Structural Invariants (Start/End/Alternation)
-  // This MUST run after pairing because pairing can drop/add turns.
-  const final = enforceRoleConstraints(coalesced, sentinels);
+  let final = enforceRoleConstraints(coalesced, sentinels);
 
-  debugLogger.log(
-    `[HistoryHardener] Finished hardening. Final history has ${final.length} turns.`,
-  );
-
-  // Final verification log of roles to help debug 400 errors
-  const roleSequence = final.map((t) => t.role).join(' -> ');
-  debugLogger.log(`[HistoryHardener] Final role sequence: ${roleSequence}`);
+  // Pass 5: Final Scrubbing (Remove custom/non-standard properties for API compatibility)
+  final = scrubHistory(final);
 
   return final;
 }
@@ -298,4 +287,59 @@ function enforceRoleConstraints(
 
   // 3. Final Alternation Check (redundant if coalesce works, but safe)
   return coalesce(result);
+}
+
+/**
+ * Deep-scrubs the history to remove any non-standard properties from Content and Part objects.
+ * This ensures compatibility with strict APIs (like Vertex AI) that reject unknown fields.
+ */
+export function scrubHistory(history: Content[]): Content[] {
+  return history.map((content) => ({
+    role: content.role,
+    parts: (content.parts || []).map(scrubPart),
+  }));
+}
+
+function scrubPart(part: Part): Part {
+  const scrubbed: any = {};
+
+  if ('text' in part && typeof part.text === 'string') {
+    scrubbed.text = part.text;
+  }
+  if ('inlineData' in part) {
+    scrubbed.inlineData = part.inlineData;
+  }
+  if ('functionCall' in part && part.functionCall) {
+    scrubbed.functionCall = {
+      name: part.functionCall.name,
+      args: part.functionCall.args,
+    };
+    if (part.functionCall.id) {
+      scrubbed.functionCall.id = part.functionCall.id;
+    }
+  }
+  if ('thoughtSignature' in part) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    scrubbed.thoughtSignature = (part as any).thoughtSignature;
+  }
+  if ('functionResponse' in part && part.functionResponse) {
+    scrubbed.functionResponse = {
+      name: part.functionResponse.name,
+      response: part.functionResponse.response,
+    };
+    if (part.functionResponse.id) {
+      scrubbed.functionResponse.id = part.functionResponse.id;
+    }
+  }
+  if ('fileData' in part) {
+    scrubbed.fileData = part.fileData;
+  }
+  if ('executableCode' in part) {
+    scrubbed.executableCode = part.executableCode;
+  }
+  if ('codeExecutionResult' in part) {
+    scrubbed.codeExecutionResult = part.codeExecutionResult;
+  }
+
+  return scrubbed as Part;
 }
